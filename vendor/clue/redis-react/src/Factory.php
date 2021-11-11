@@ -3,59 +3,83 @@
 namespace Clue\React\Redis;
 
 use Clue\Redis\Protocol\Factory as ProtocolFactory;
+use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
 use React\Promise\Deferred;
 use React\Promise\Timer\TimeoutException;
 use React\Socket\ConnectionInterface;
 use React\Socket\Connector;
 use React\Socket\ConnectorInterface;
-use InvalidArgumentException;
 
 class Factory
 {
+    /** @var LoopInterface */
     private $loop;
+
+    /** @var ConnectorInterface */
     private $connector;
+
+    /** @var ProtocolFactory */
     private $protocol;
 
     /**
-     * @param LoopInterface $loop
-     * @param ConnectorInterface|null $connector [optional] Connector to use.
-     *     Should be `null` in order to use default Connector.
-     * @param ProtocolFactory|null $protocol
+     * @param ?LoopInterface $loop
+     * @param ?ConnectorInterface $connector
+     * @param ?ProtocolFactory $protocol
      */
-    public function __construct(LoopInterface $loop, ConnectorInterface $connector = null, ProtocolFactory $protocol = null)
+    public function __construct(LoopInterface $loop = null, ConnectorInterface $connector = null, ProtocolFactory $protocol = null)
     {
-        if ($connector === null) {
-            $connector = new Connector($loop);
-        }
-
-        if ($protocol === null) {
-            $protocol = new ProtocolFactory();
-        }
-
-        $this->loop = $loop;
-        $this->connector = $connector;
-        $this->protocol = $protocol;
+        $this->loop = $loop ?: Loop::get();
+        $this->connector = $connector ?: new Connector(array(), $this->loop);
+        $this->protocol = $protocol ?: new ProtocolFactory();
     }
 
     /**
      * Create Redis client connected to address of given redis instance
      *
-     * @param string $target Redis server URI to connect to
-     * @return \React\Promise\PromiseInterface<Client> resolves with Client or rejects with \Exception
+     * @param string $uri Redis server URI to connect to
+     * @return \React\Promise\PromiseInterface<Client,\Exception> Promise that will
+     *     be fulfilled with `Client` on success or rejects with `\Exception` on error.
      */
-    public function createClient($target)
+    public function createClient($uri)
     {
-        try {
-            $parts = $this->parseUrl($target);
-        } catch (InvalidArgumentException $e) {
-            return \React\Promise\reject($e);
+        // support `redis+unix://` scheme for Unix domain socket (UDS) paths
+        if (preg_match('/^(redis\+unix:\/\/(?:[^:]*:[^@]*@)?)(.+?)?$/', $uri, $match)) {
+            $parts = parse_url($match[1] . 'localhost/' . $match[2]);
+        } else {
+            if (strpos($uri, '://') === false) {
+                $uri = 'redis://' . $uri;
+            }
+
+            $parts = parse_url($uri);
         }
 
-        $connecting = $this->connector->connect($parts['authority']);
-        $deferred = new Deferred(function ($_, $reject) use ($connecting) {
+        $uri = preg_replace(array('/(:)[^:\/]*(@)/', '/([?&]password=).*?($|&)/'), '$1***$2', $uri);
+        if ($parts === false || !isset($parts['scheme'], $parts['host']) || !in_array($parts['scheme'], array('redis', 'rediss', 'redis+unix'))) {
+            return \React\Promise\reject(new \InvalidArgumentException(
+                'Invalid Redis URI given (EINVAL)',
+                defined('SOCKET_EINVAL') ? SOCKET_EINVAL : 22
+            ));
+        }
+
+        $args = array();
+        parse_str(isset($parts['query']) ? $parts['query'] : '', $args);
+
+        $authority = $parts['host'] . ':' . (isset($parts['port']) ? $parts['port'] : 6379);
+        if ($parts['scheme'] === 'rediss') {
+            $authority = 'tls://' . $authority;
+        } elseif ($parts['scheme'] === 'redis+unix') {
+            $authority = 'unix://' . substr($parts['path'], 1);
+            unset($parts['path']);
+        }
+        $connecting = $this->connector->connect($authority);
+
+        $deferred = new Deferred(function ($_, $reject) use ($connecting, $uri) {
             // connection cancelled, start with rejecting attempt, then clean up
-            $reject(new \RuntimeException('Connection to Redis server cancelled'));
+            $reject(new \RuntimeException(
+                'Connection to ' . $uri . ' cancelled (ECONNABORTED)',
+                defined('SOCKET_ECONNABORTED') ? SOCKET_ECONNABORTED : 103
+            ));
 
             // either close successful connection or cancel pending connection attempt
             $connecting->then(function (ConnectionInterface $connection) {
@@ -67,46 +91,68 @@ class Factory
         $protocol = $this->protocol;
         $promise = $connecting->then(function (ConnectionInterface $stream) use ($protocol) {
             return new StreamingClient($stream, $protocol->createResponseParser(), $protocol->createSerializer());
-        }, function (\Exception $e) {
+        }, function (\Exception $e) use ($uri) {
             throw new \RuntimeException(
-                'Connection to Redis server failed because underlying transport connection failed',
-                0,
+                'Connection to ' . $uri . ' failed: ' . $e->getMessage(),
+                $e->getCode(),
                 $e
             );
         });
 
-        if (isset($parts['auth'])) {
-            $promise = $promise->then(function (StreamingClient $client) use ($parts) {
-                return $client->auth($parts['auth'])->then(
-                    function () use ($client) {
-                        return $client;
+        // use `?password=secret` query or `user:secret@host` password form URL
+        $pass = isset($args['password']) ? $args['password'] : (isset($parts['pass']) ? rawurldecode($parts['pass']) : null);
+        if (isset($args['password']) || isset($parts['pass'])) {
+            $pass = isset($args['password']) ? $args['password'] : rawurldecode($parts['pass']);
+            $promise = $promise->then(function (StreamingClient $redis) use ($pass, $uri) {
+                return $redis->auth($pass)->then(
+                    function () use ($redis) {
+                        return $redis;
                     },
-                    function ($error) use ($client) {
-                        $client->close();
+                    function (\Exception $e) use ($redis, $uri) {
+                        $redis->close();
+
+                        $const = '';
+                        $errno = $e->getCode();
+                        if ($errno === 0) {
+                            $const = ' (EACCES)';
+                            $errno = $e->getCode() ?: (defined('SOCKET_EACCES') ? SOCKET_EACCES : 13);
+                        }
 
                         throw new \RuntimeException(
-                            'Connection to Redis server failed because AUTH command failed',
-                            0,
-                            $error
+                            'Connection to ' . $uri . ' failed during AUTH command: ' . $e->getMessage() . $const,
+                            $errno,
+                            $e
                         );
                     }
                 );
             });
         }
 
-        if (isset($parts['db'])) {
-            $promise = $promise->then(function (StreamingClient $client) use ($parts) {
-                return $client->select($parts['db'])->then(
-                    function () use ($client) {
-                        return $client;
+        // use `?db=1` query or `/1` path (skip first slash)
+        if (isset($args['db']) || (isset($parts['path']) && $parts['path'] !== '/')) {
+            $db = isset($args['db']) ? $args['db'] : substr($parts['path'], 1);
+            $promise = $promise->then(function (StreamingClient $redis) use ($db, $uri) {
+                return $redis->select($db)->then(
+                    function () use ($redis) {
+                        return $redis;
                     },
-                    function ($error) use ($client) {
-                        $client->close();
+                    function (\Exception $e) use ($redis, $uri) {
+                        $redis->close();
+
+                        $const = '';
+                        $errno = $e->getCode();
+                        if ($errno === 0 && strpos($e->getMessage(), 'NOAUTH ') === 0) {
+                            $const = ' (EACCES)';
+                            $errno = defined('SOCKET_EACCES') ? SOCKET_EACCES : 13;
+                        } elseif ($errno === 0) {
+                            $const = ' (ENOENT)';
+                            $errno = defined('SOCKET_ENOENT') ? SOCKET_ENOENT : 2;
+                        }
 
                         throw new \RuntimeException(
-                            'Connection to Redis server failed because SELECT command failed',
-                            0,
-                            $error
+                            'Connection to ' . $uri . ' failed during SELECT command: ' . $e->getMessage() . $const,
+                            $errno,
+                            $e
                         );
                     }
                 );
@@ -116,15 +162,16 @@ class Factory
         $promise->then(array($deferred, 'resolve'), array($deferred, 'reject'));
 
         // use timeout from explicit ?timeout=x parameter or default to PHP's default_socket_timeout (60)
-        $timeout = isset($parts['timeout']) ? $parts['timeout'] : (int) ini_get("default_socket_timeout");
+        $timeout = isset($args['timeout']) ? (float) $args['timeout'] : (int) ini_get("default_socket_timeout");
         if ($timeout < 0) {
             return $deferred->promise();
         }
 
-        return \React\Promise\Timer\timeout($deferred->promise(), $timeout, $this->loop)->then(null, function ($e) {
+        return \React\Promise\Timer\timeout($deferred->promise(), $timeout, $this->loop)->then(null, function ($e) use ($uri) {
             if ($e instanceof TimeoutException) {
                 throw new \RuntimeException(
-                    'Connection to Redis server timed out after ' . $e->getTimeout() . ' seconds'
+                    'Connection to ' . $uri . ' timed out after ' . $e->getTimeout() . ' seconds (ETIMEDOUT)',
+                    defined('SOCKET_ETIMEDOUT') ? SOCKET_ETIMEDOUT : 110
                 );
             }
             throw $e;
@@ -140,64 +187,5 @@ class Factory
     public function createLazyClient($target)
     {
         return new LazyClient($target, $this, $this->loop);
-    }
-
-    /**
-     * @param string $target
-     * @return array with keys authority, auth and db
-     * @throws InvalidArgumentException
-     */
-    private function parseUrl($target)
-    {
-        $ret = array();
-        // support `redis+unix://` scheme for Unix domain socket (UDS) paths
-        if (preg_match('/^redis\+unix:\/\/([^:]*:[^@]*@)?(.+?)(\?.*)?$/', $target, $match)) {
-            $ret['authority'] = 'unix://' . $match[2];
-            $target = 'redis://' . (isset($match[1]) ? $match[1] : '') . 'localhost' . (isset($match[3]) ? $match[3] : '');
-        }
-
-        if (strpos($target, '://') === false) {
-            $target = 'redis://' . $target;
-        }
-
-        $parts = parse_url($target);
-        if ($parts === false || !isset($parts['scheme'], $parts['host']) || !in_array($parts['scheme'], array('redis', 'rediss'))) {
-            throw new InvalidArgumentException('Given URL can not be parsed');
-        }
-
-        if (isset($parts['pass'])) {
-            $ret['auth'] = rawurldecode($parts['pass']);
-        }
-
-        if (isset($parts['path']) && $parts['path'] !== '') {
-            // skip first slash
-            $ret['db'] = substr($parts['path'], 1);
-        }
-
-        if (!isset($ret['authority'])) {
-            $ret['authority'] =
-                ($parts['scheme'] === 'rediss' ? 'tls://' : '') .
-                $parts['host'] . ':' .
-                (isset($parts['port']) ? $parts['port'] : 6379);
-        }
-
-        if (isset($parts['query'])) {
-            $args = array();
-            parse_str($parts['query'], $args);
-
-            if (isset($args['password'])) {
-                $ret['auth'] = $args['password'];
-            }
-
-            if (isset($args['db'])) {
-                $ret['db'] = $args['db'];
-            }
-
-            if (isset($args['timeout'])) {
-                $ret['timeout'] = (float) $args['timeout'];
-            }
-        }
-
-        return $ret;
     }
 }

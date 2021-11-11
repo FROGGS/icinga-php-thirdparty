@@ -2,20 +2,21 @@
 
 namespace Clue\React\Block;
 
+use React\EventLoop\Loop;
 use React\EventLoop\LoopInterface;
-use React\Promise\PromiseInterface;
-use React\Promise\CancellablePromiseInterface;
-use UnderflowException;
-use Exception;
 use React\Promise;
+use React\Promise\CancellablePromiseInterface;
+use React\Promise\PromiseInterface;
 use React\Promise\Timer;
 use React\Promise\Timer\TimeoutException;
+use Exception;
+use UnderflowException;
 
 /**
  * Wait/sleep for `$time` seconds.
  *
  * ```php
- * Block\sleep(1.5, $loop);
+ * Clue\React\Block\sleep(1.5, $loop);
  * ```
  *
  * This function will only return after the given `$time` has elapsed. In the
@@ -28,11 +29,24 @@ use React\Promise\Timer\TimeoutException;
  * really small (or negative) value, it will still start a timer and will thus
  * trigger at the earliest possible time in the future.
  *
+ * This function takes an optional `LoopInterface|null $loop` parameter that can be used to
+ * pass the event loop instance to use. You can use a `null` value here in order to
+ * use the [default loop](https://github.com/reactphp/event-loop#loop). This value
+ * SHOULD NOT be given unless you're sure you want to explicitly use a given event
+ * loop instance.
+ *
+ * Note that this function will assume control over the event loop. Internally, it
+ * will actually `run()` the loop until the timer fires and then calls `stop()` to
+ * terminate execution of the loop. This means this function is more suited for
+ * short-lived program executions when using async APIs is not feasible. For
+ * long-running applications, using event-driven APIs by leveraging timers
+ * is usually preferable.
+ *
  * @param float $time
- * @param LoopInterface $loop
+ * @param ?LoopInterface $loop
  * @return void
  */
-function sleep($time, LoopInterface $loop)
+function sleep($time, LoopInterface $loop = null)
 {
     await(Timer\resolve($time, $loop), $loop);
 }
@@ -41,7 +55,7 @@ function sleep($time, LoopInterface $loop)
  * Block waiting for the given `$promise` to be fulfilled.
  *
  * ```php
- * $result = Block\await($promise, $loop, $timeout);
+ * $result = Clue\React\Block\await($promise, $loop);
  * ```
  *
  * This function will only return after the given `$promise` has settled, i.e.
@@ -57,7 +71,7 @@ function sleep($time, LoopInterface $loop)
  *
  * ```php
  * try {
- *     $result = Block\await($promise, $loop);
+ *     $result = Clue\React\Block\await($promise, $loop);
  *     // promise successfully fulfilled with $result
  *     echo 'Result: ' . $result;
  * } catch (Exception $exception) {
@@ -68,27 +82,44 @@ function sleep($time, LoopInterface $loop)
  *
  * See also the [examples](../examples/).
  *
- * If no `$timeout` argument is given and the promise stays pending, then this
- * will potentially wait/block forever until the promise is settled.
+ * This function takes an optional `LoopInterface|null $loop` parameter that can be used to
+ * pass the event loop instance to use. You can use a `null` value here in order to
+ * use the [default loop](https://github.com/reactphp/event-loop#loop). This value
+ * SHOULD NOT be given unless you're sure you want to explicitly use a given event
+ * loop instance.
  *
- * If a `$timeout` argument is given and the promise is still pending once the
+ * If no `$timeout` argument is given and the promise stays pending, then this
+ * will potentially wait/block forever until the promise is settled. To avoid
+ * this, API authors creating promises are expected to provide means to
+ * configure a timeout for the promise instead. For more details, see also the
+ * [`timeout()` function](https://github.com/reactphp/promise-timer#timeout).
+ *
+ * If the deprecated `$timeout` argument is given and the promise is still pending once the
  * timeout triggers, this will `cancel()` the promise and throw a `TimeoutException`.
  * This implies that if you pass a really small (or negative) value, it will still
  * start a timer and will thus trigger at the earliest possible time in the future.
  *
+ * Note that this function will assume control over the event loop. Internally, it
+ * will actually `run()` the loop until the promise settles and then calls `stop()` to
+ * terminate execution of the loop. This means this function is more suited for
+ * short-lived promise executions when using promise-based APIs is not feasible.
+ * For long-running applications, using promise-based APIs by leveraging chained
+ * `then()` calls is usually preferable.
+ *
  * @param PromiseInterface $promise
- * @param LoopInterface    $loop
- * @param null|float       $timeout (optional) maximum timeout in seconds or null=wait forever
+ * @param ?LoopInterface   $loop
+ * @param ?float           $timeout [deprecated] (optional) maximum timeout in seconds or null=wait forever
  * @return mixed returns whatever the promise resolves to
  * @throws Exception when the promise is rejected
  * @throws TimeoutException if the $timeout is given and triggers
  */
-function await(PromiseInterface $promise, LoopInterface $loop, $timeout = null)
+function await(PromiseInterface $promise, LoopInterface $loop = null, $timeout = null)
 {
     $wait = true;
     $resolved = null;
     $exception = null;
     $rejected = false;
+    $loop = $loop ?: Loop::get();
 
     if ($timeout !== null) {
         $promise = Timer\timeout($promise, $timeout, $loop);
@@ -117,11 +148,15 @@ function await(PromiseInterface $promise, LoopInterface $loop, $timeout = null)
     }
 
     if ($rejected) {
-        if (!$exception instanceof \Exception) {
+        if (!$exception instanceof \Exception && !$exception instanceof \Throwable) {
             $exception = new \UnexpectedValueException(
-                'Promise rejected with unexpected value of type ' . (is_object($exception) ? get_class($exception) : gettype($exception)),
-                0,
-                $exception instanceof \Throwable ? $exception : null
+                'Promise rejected with unexpected value of type ' . (is_object($exception) ? get_class($exception) : gettype($exception))
+            );
+        } elseif (!$exception instanceof \Exception) {
+            $exception = new \UnexpectedValueException(
+                'Promise rejected with unexpected ' . get_class($exception) . ': ' . $exception->getMessage(),
+                $exception->getCode(),
+                $exception
             );
         }
 
@@ -140,7 +175,7 @@ function await(PromiseInterface $promise, LoopInterface $loop, $timeout = null)
  *     $promise2
  * );
  *
- * $firstResult = Block\awaitAny($promises, $loop, $timeout);
+ * $firstResult = Clue\React\Block\awaitAny($promises, $loop);
  *
  * echo 'First result: ' . $firstResult;
  * ```
@@ -157,23 +192,39 @@ function await(PromiseInterface $promise, LoopInterface $loop, $timeout = null)
  * Once ALL promises reject, this function will fail and throw an `UnderflowException`.
  * Likewise, this will throw if an empty array of `$promises` is passed.
  *
- * If no `$timeout` argument is given and ALL promises stay pending, then this
- * will potentially wait/block forever until the promise is fulfilled.
+ * This function takes an optional `LoopInterface|null $loop` parameter that can be used to
+ * pass the event loop instance to use. You can use a `null` value here in order to
+ * use the [default loop](https://github.com/reactphp/event-loop#loop). This value
+ * SHOULD NOT be given unless you're sure you want to explicitly use a given event
+ * loop instance.
  *
- * If a `$timeout` argument is given and ANY promises are still pending once
+ * If no `$timeout` argument is given and ALL promises stay pending, then this
+ * will potentially wait/block forever until the promise is fulfilled. To avoid
+ * this, API authors creating promises are expected to provide means to
+ * configure a timeout for the promise instead. For more details, see also the
+ * [`timeout()` function](https://github.com/reactphp/promise-timer#timeout).
+ *
+ * If the deprecated `$timeout` argument is given and ANY promises are still pending once
  * the timeout triggers, this will `cancel()` all pending promises and throw a
  * `TimeoutException`. This implies that if you pass a really small (or negative)
  * value, it will still start a timer and will thus trigger at the earliest
  * possible time in the future.
  *
- * @param array         $promises
- * @param LoopInterface $loop
- * @param null|float    $timeout (optional) maximum timeout in seconds or null=wait forever
+ * Note that this function will assume control over the event loop. Internally, it
+ * will actually `run()` the loop until the promise settles and then calls `stop()` to
+ * terminate execution of the loop. This means this function is more suited for
+ * short-lived promise executions when using promise-based APIs is not feasible.
+ * For long-running applications, using promise-based APIs by leveraging chained
+ * `then()` calls is usually preferable.
+ *
+ * @param PromiseInterface[]  $promises
+ * @param ?LoopInterface      $loop
+ * @param ?float              $timeout [deprecated] (optional) maximum timeout in seconds or null=wait forever
  * @return mixed returns whatever the first promise resolves to
  * @throws Exception if ALL promises are rejected
  * @throws TimeoutException if the $timeout is given and triggers
  */
-function awaitAny(array $promises, LoopInterface $loop, $timeout = null)
+function awaitAny(array $promises, LoopInterface $loop = null, $timeout = null)
 {
     // Explicitly overwrite argument with null value. This ensure that this
     // argument does not show up in the stack trace in PHP 7+ only.
@@ -220,7 +271,7 @@ function awaitAny(array $promises, LoopInterface $loop, $timeout = null)
  *     $promise2
  * );
  *
- * $allResults = Block\awaitAll($promises, $loop, $timeout);
+ * $allResults = Clue\React\Block\awaitAll($promises, $loop);
  *
  * echo 'First promise resolved with: ' . $allResults[0];
  * ```
@@ -239,23 +290,39 @@ function awaitAny(array $promises, LoopInterface $loop, $timeout = null)
  * and throw an `Exception`. If the promise did not reject with an `Exception`,
  * then this function will throw an `UnexpectedValueException` instead.
  *
- * If no `$timeout` argument is given and ANY promises stay pending, then this
- * will potentially wait/block forever until the promise is fulfilled.
+ * This function takes an optional `LoopInterface|null $loop` parameter that can be used to
+ * pass the event loop instance to use. You can use a `null` value here in order to
+ * use the [default loop](https://github.com/reactphp/event-loop#loop). This value
+ * SHOULD NOT be given unless you're sure you want to explicitly use a given event
+ * loop instance.
  *
- * If a `$timeout` argument is given and ANY promises are still pending once
+ * If no `$timeout` argument is given and ANY promises stay pending, then this
+ * will potentially wait/block forever until the promise is fulfilled. To avoid
+ * this, API authors creating promises are expected to provide means to
+ * configure a timeout for the promise instead. For more details, see also the
+ * [`timeout()` function](https://github.com/reactphp/promise-timer#timeout).
+ *
+ * If the deprecated `$timeout` argument is given and ANY promises are still pending once
  * the timeout triggers, this will `cancel()` all pending promises and throw a
  * `TimeoutException`. This implies that if you pass a really small (or negative)
  * value, it will still start a timer and will thus trigger at the earliest
  * possible time in the future.
  *
- * @param array         $promises
- * @param LoopInterface $loop
- * @param null|float    $timeout (optional) maximum timeout in seconds or null=wait forever
+ * Note that this function will assume control over the event loop. Internally, it
+ * will actually `run()` the loop until the promise settles and then calls `stop()` to
+ * terminate execution of the loop. This means this function is more suited for
+ * short-lived promise executions when using promise-based APIs is not feasible.
+ * For long-running applications, using promise-based APIs by leveraging chained
+ * `then()` calls is usually preferable.
+ *
+ * @param PromiseInterface[]  $promises
+ * @param ?LoopInterface      $loop
+ * @param ?float              $timeout [deprecated] (optional) maximum timeout in seconds or null=wait forever
  * @return array returns an array with whatever each promise resolves to
  * @throws Exception when ANY promise is rejected
  * @throws TimeoutException if the $timeout is given and triggers
  */
-function awaitAll(array $promises, LoopInterface $loop, $timeout = null)
+function awaitAll(array $promises, LoopInterface $loop = null, $timeout = null)
 {
     // Explicitly overwrite argument with null value. This ensure that this
     // argument does not show up in the stack trace in PHP 7+ only.
@@ -283,7 +350,7 @@ function awaitAll(array $promises, LoopInterface $loop, $timeout = null)
 function _cancelAllPromises(array $promises)
 {
     foreach ($promises as $promise) {
-        if ($promise instanceof CancellablePromiseInterface) {
+        if ($promise instanceof PromiseInterface && ($promise instanceof CancellablePromiseInterface || !\interface_exists('React\Promise\CancellablePromiseInterface'))) {
             $promise->cancel();
         }
     }
